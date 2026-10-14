@@ -7,7 +7,7 @@
 //  exposes observable voice state for the panel UI.
 //
 
-import AVFoundation
+@preconcurrency import AVFoundation
 import Combine
 import Foundation
 import PostHog
@@ -19,6 +19,31 @@ enum CompanionVoiceState {
     case listening
     case processing
     case responding
+}
+
+/// Which chat "brain" powers the companion. Cloud (Claude, via the Worker
+/// proxy) or a local model server (Ollama, llama.cpp, LM Studio, ...).
+/// Persisted to UserDefaults so the choice survives app restarts.
+enum ChatBackend: String {
+    case claude
+    case local
+}
+
+/// Live connection status of the local LLM server, shown in the panel's
+/// backend configuration section.
+enum LocalLLMAvailability: Equatable {
+    case idle
+    case checking
+    case connected
+    case failed(String)
+}
+
+/// Persisted UserDefaults keys for chat-backend configuration.
+private enum ChatBackendPreferences {
+    static let backend = "clickyChatBackend"
+    static let localBaseURL = "clickyLocalBaseURL"
+    static let localModel = "clickyLocalModel"
+    static let sendLocalScreenshots = "clickySendLocalScreenshots"
 }
 
 @MainActor
@@ -79,6 +104,124 @@ final class CompanionManager: ObservableObject {
     private lazy var elevenLabsTTSClient: ElevenLabsTTSClient = {
         return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
     }()
+
+    /// Local model server backend (Ollama native or OpenAI-compatible),
+    /// auto-detected from the configured base URL. Built from persisted config
+    /// and lazily initialized; updated in place when the user edits settings.
+    private lazy var localLLMProvider: LocalLLMProvider = {
+        return LocalLLMProvider(baseURL: localBaseURL, model: localModel)
+    }()
+
+    /// The chat backend currently driving the companion. Selected by
+    /// `chatBackend`; lets the two pipelines stay completely decoupled.
+    private var activeChatProvider: any BuddyChatProvider {
+        switch chatBackend {
+        case .claude:
+            return claudeAPI
+        case .local:
+            return localLLMProvider
+        }
+    }
+
+    // MARK: - Chat Backend Configuration
+
+    /// Sensible built-in fallbacks, overridable at build time via Info.plist
+    /// (`LocalLLMBaseURL` / `LocalLLMModel`) or at runtime via UserDefaults.
+    private static let defaultLocalBaseURL = AppBundleConfiguration
+        .stringValue(forKey: "LocalLLMBaseURL") ?? "http://localhost:11434"
+    /// No hard-coded default model: a fresh install can't know what the user
+    /// has pulled locally, so the field starts empty and the panel's "Refresh"
+    /// button discovers the real models the user's Ollama reports. The panel
+    /// placeholder shows the format ("e.g. qwen3.8:27b-mlx") as a hint.
+    private static let defaultLocalModel =
+        AppBundleConfiguration.stringValue(forKey: "LocalLLMModel") ?? ""
+
+    /// Which brain the companion talks to. Drives `activeChatProvider`.
+    @Published var chatBackend: ChatBackend =
+        ChatBackend(rawValue: UserDefaults.standard.string(forKey: ChatBackendPreferences.backend) ?? "claude")
+        ?? .claude
+
+    /// Base URL of the local server (e.g. http://localhost:11434).
+    @Published var localBaseURL: String =
+        ChatBackendPreferences.localBaseURL.load(default: CompanionManager.defaultLocalBaseURL)
+
+    /// Model id passed to the local server (e.g. "llava", "qwen2.5vl:7b").
+    @Published var localModel: String =
+        ChatBackendPreferences.localModel.load(default: CompanionManager.defaultLocalModel)
+
+    /// When the local backend is active, whether screenshots are sent to the
+    /// model. Off -> text-only (works for text models, no element pointing).
+    /// Defaults on because the companion's whole point is seeing the screen.
+    @Published var sendLocalScreenshots: Bool =
+        ChatBackendPreferences.sendLocalScreenshots.loadBool(default: true)
+
+    /// Live reachability of the configured local server, shown in the panel.
+    @Published var localLLMAvailability: LocalLLMAvailability = .idle
+
+    /// The models the last "Refresh" probe reported, with their capabilities
+    /// (vision, size, runner). Drives the panel's "available on this machine"
+    /// list so the user can pick a model that actually sees the screen.
+    @Published var localModelCatalog: LocalModelCatalog = .empty
+
+    func setChatBackend(_ backend: ChatBackend) {
+        chatBackend = backend
+        UserDefaults.standard.set(backend.rawValue, forKey: ChatBackendPreferences.backend)
+
+        // Keep the local provider's config in sync so its requests go to the
+        // right place, and kick it into existence if this is the first use.
+        localLLMProvider.baseURL = localBaseURL
+        localLLMProvider.model = localModel
+        if backend == .local {
+            checkLocalLLMAvailability()
+        }
+    }
+
+    func setLocalBaseURL(_ localBaseURL: String) {
+        self.localBaseURL = localBaseURL
+        UserDefaults.standard.set(localBaseURL, forKey: ChatBackendPreferences.localBaseURL)
+        localLLMProvider.baseURL = localBaseURL
+        if chatBackend == .local {
+            checkLocalLLMAvailability()
+        }
+    }
+
+    func setLocalModel(_ localModel: String) {
+        self.localModel = localModel
+        UserDefaults.standard.set(localModel, forKey: ChatBackendPreferences.localModel)
+        localLLMProvider.model = localModel
+    }
+
+    func setSendLocalScreenshots(_ sendLocalScreenshots: Bool) {
+        self.sendLocalScreenshots = sendLocalScreenshots
+        UserDefaults.standard.set(sendLocalScreenshots, forKey: ChatBackendPreferences.sendLocalScreenshots)
+    }
+
+    /// Probes the configured local server and populates the panel's model
+    /// catalog: reachability, the available models with their capabilities, and
+    /// whether the configured model is among them. Runs off the main actor and
+    /// writes back `localModelCatalog` + `localLLMAvailability` on it.
+    func checkLocalLLMAvailability() {
+        localLLMAvailability = .checking
+        localModelCatalog = .empty
+        Task { @MainActor in
+            let catalog = await localLLMProvider.discoverModels()
+            self.localModelCatalog = catalog
+            self.localLLMAvailability = catalog.connected
+                ? .connected
+                : .failed(catalog.reason ?? "unreachable")
+        }
+    }
+
+    /// Whether a screenshot should be attached to the outgoing chat request.
+    /// Cloud (Claude) always sees the screen. Local respects the user's toggle.
+    private var shouldSendScreenshotsToModel: Bool {
+        switch chatBackend {
+        case .claude:
+            return true
+        case .local:
+            return sendLocalScreenshots
+        }
+    }
 
     /// Conversation history so Claude remembers prior exchanges within a session.
     /// Each entry is the user's transcript and Claude's response.
@@ -146,31 +289,6 @@ final class CompanionManager: ObservableObject {
         set { UserDefaults.standard.set(newValue, forKey: "hasCompletedOnboarding") }
     }
 
-    /// Whether the user has submitted their email during onboarding.
-    @Published var hasSubmittedEmail: Bool = UserDefaults.standard.bool(forKey: "hasSubmittedEmail")
-
-    /// Submits the user's email to FormSpark and identifies them in PostHog.
-    func submitEmail(_ email: String) {
-        let trimmedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedEmail.isEmpty else { return }
-
-        hasSubmittedEmail = true
-        UserDefaults.standard.set(true, forKey: "hasSubmittedEmail")
-
-        // Identify user in PostHog
-        PostHogSDK.shared.identify(trimmedEmail, userProperties: [
-            "email": trimmedEmail
-        ])
-
-        // Submit to FormSpark
-        Task {
-            var request = URLRequest(url: URL(string: "https://submit-form.com/RWbGJxmIs")!)
-            request.httpMethod = "POST"
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.httpBody = try? JSONSerialization.data(withJSONObject: ["email": trimmedEmail])
-            _ = try? await URLSession.shared.data(for: request)
-        }
-    }
 
     func start() {
         refreshAllPermissions()
@@ -517,7 +635,7 @@ final class CompanionManager: ObservableObject {
                     updateDraftText: { _ in
                         // Partial transcripts are hidden (waveform-only UI)
                     },
-                    submitDraftText: { [weak self] finalTranscript in
+                    submitDraftText: { [weak self = self] finalTranscript in
                         self?.lastTranscript = finalTranscript
                         print("🗣️ Companion received transcript: \(finalTranscript)")
                         ClickyAnalytics.trackUserMessageSent(transcript: finalTranscript)
@@ -605,13 +723,18 @@ final class CompanionManager: ObservableObject {
                     return (data: capture.imageData, label: capture.label + dimensionInfo)
                 }
 
+                // For a text-only local model, send no images so the request is
+                // small and the model doesn't choke on images it can't read.
+                // The cloud backend always sees the screen.
+                let imagesForThisRequest = shouldSendScreenshotsToModel ? labeledImages : []
+
                 // Pass conversation history so Claude remembers prior exchanges
                 let historyForAPI = conversationHistory.map { entry in
                     (userPlaceholder: entry.userTranscript, assistantResponse: entry.assistantResponse)
                 }
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
+                let (fullResponseText, _) = try await activeChatProvider.analyzeImageStreaming(
+                    images: imagesForThisRequest,
                     systemPrompt: Self.companionVoiceResponseSystemPrompt,
                     conversationHistory: historyForAPI,
                     userPrompt: transcript,
@@ -982,9 +1105,14 @@ final class CompanionManager: ObservableObject {
                 let dimensionInfo = " (image dimensions: \(cursorScreenCapture.screenshotWidthInPixels)x\(cursorScreenCapture.screenshotHeightInPixels) pixels)"
                 let labeledImages = [(data: cursorScreenCapture.imageData, label: cursorScreenCapture.label + dimensionInfo)]
 
-                let (fullResponseText, _) = try await claudeAPI.analyzeImageStreaming(
-                    images: labeledImages,
-                    systemPrompt: Self.onboardingDemoSystemPrompt,
+                // The onboarding demo is about pointing at on-screen things, so a
+                // text-only local model can't demo it. Send no images in that case;
+                // the demo will simply find nothing to point at and no-op.
+                let imagesForThisRequest = shouldSendScreenshotsToModel ? labeledImages : []
+
+                let (fullResponseText, _) = try await activeChatProvider.analyzeImageStreaming(
+                    images: imagesForThisRequest,
+                    systemPrompt: Self.onboardingDemoSystemPrompt, conversationHistory: [],
                     userPrompt: "look around my screen and find something interesting to point at",
                     onTextChunk: { _ in }
                 )
@@ -1022,5 +1150,27 @@ final class CompanionManager: ObservableObject {
                 print("⚠️ Onboarding demo error: \(error)")
             }
         }
+    }
+}
+
+// MARK: - UserDefaults helpers for chat-backend preferences
+//
+// Small, readable helpers so call sites read "the key, loaded with this
+// default" instead of verbose object/bool/string gymnastics. The key is the
+// String on which the method is called.
+private extension String {
+    /// Persisted value stored under this string as a key, or `fallback`
+    /// when it was never set.
+    func load(default fallback: String) -> String {
+        UserDefaults.standard.string(forKey: self) ?? fallback
+    }
+
+    /// Persisted bool stored under this string as a key, or `fallback` when the
+    /// key is absent — so "never set" behaves like the default, not like false.
+    func loadBool(default fallback: Bool) -> Bool {
+        guard UserDefaults.standard.object(forKey: self) != nil else {
+            return fallback
+        }
+        return UserDefaults.standard.bool(forKey: self)
     }
 }

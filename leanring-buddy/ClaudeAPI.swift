@@ -6,9 +6,18 @@
 import Foundation
 
 /// Claude API helper with streaming for progressive text display.
-class ClaudeAPI {
+///
+/// Conforms to `BuddyChatProvider` so the companion pipeline can treat it as
+/// one interchangeable chat "brain" alongside the local LLM provider.
+class ClaudeAPI: BuddyChatProvider {
     private static let tlsWarmupLock = NSLock()
     private static var hasStartedTLSWarmup = false
+
+    /// Label shown in the menu bar panel.
+    let displayName = "Claude"
+
+    /// Claude vision accepts image inputs.
+    let supportsVision = true
 
     private let apiURL: URL
     var model: String

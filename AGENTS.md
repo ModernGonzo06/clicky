@@ -14,7 +14,7 @@ All API keys live on a Cloudflare Worker proxy — nothing sensitive ships in th
 - **App Type**: Menu bar-only (`LSUIElement=true`), no dock icon or main window
 - **Framework**: SwiftUI (macOS native) with AppKit bridging for menu bar panel and cursor overlay
 - **Pattern**: MVVM with `@StateObject` / `@Published` state management
-- **AI Chat**: Claude (Sonnet 4.6 default, Opus 4.6 optional) via Cloudflare Worker proxy with SSE streaming
+- **AI Chat**: Pluggable `BuddyChatProvider` "brain". Cloud backend is Claude (Sonnet 4.6 default, Opus 4.6 optional) via the Cloudflare Worker proxy with SSE streaming; local backend is a `LocalLLMProvider` talking to an Ollama-native or OpenAI-compatible model server on localhost. The panel switches between them; the rest of the pipeline is backend-agnostic.
 - **Speech-to-Text**: AssemblyAI real-time streaming (`u3-rt-pro` model) via websocket, with OpenAI and Apple Speech as fallbacks
 - **Text-to-Speech**: ElevenLabs (`eleven_flash_v2_5` model) via Cloudflare Worker proxy
 - **Screen Capture**: ScreenCaptureKit (macOS 14.2+), multi-monitor support
@@ -48,14 +48,16 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 
 **Transient Cursor Mode**: When "Show Clicky" is off, pressing the hotkey fades in the cursor overlay for the duration of the interaction (recording → response → TTS → optional pointing), then fades it out automatically after 1 second of inactivity.
 
+**Pluggable Chat Brain**: The "brain" sits behind one protocol, `BuddyChatProvider` (`analyzeImageStreaming` + `displayName`), mirroring the `BuddyTranscriptionProvider` layer on the input side. `CompanionManager.activeChatProvider` returns the cloud `ClaudeAPI` or the local `LocalLLMProvider` based on persisted `chatBackend` state. `LocalLLMProvider` auto-detects its wire dialect (Ollama native `/api/chat` vs OpenAI-compatible `/v1/chat/completions`) from the base URL, streams both newline-delimited JSON and SSE, and supports vision either way — a `sendLocalScreenshots` toggle drops the screenshots entirely for text-only models. Both backends share the same system prompt and `[POINT:...]` parsing, so element-pointing works identically. TTS and transcription stay in the Cloudflare Worker proxy; only the brain is swapped.
+
 ## Key Files
 
 | File | Lines | Purpose |
 |------|-------|---------|
 | `leanring_buddyApp.swift` | ~89 | Menu bar app entry point. Uses `@NSApplicationDelegateAdaptor` with `CompanionAppDelegate` which creates `MenuBarPanelManager` and starts `CompanionManager`. No main window — the app lives entirely in the status bar. |
-| `CompanionManager.swift` | ~1026 | Central state machine. Owns dictation, shortcut monitoring, screen capture, Claude API, ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → Claude → TTS → pointing pipeline. |
-| `MenuBarPanelManager.swift` | ~243 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor. |
-| `CompanionPanelView.swift` | ~761 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, model picker (Sonnet/Opus), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
+| `CompanionManager.swift` | ~1186 | Central state machine. Owns dictation, shortcut monitoring, screen capture, the chat "brain", ElevenLabs TTS, and overlay management. Tracks voice state (idle/listening/processing/responding), conversation history, model selection, and cursor visibility. Coordinates the full push-to-talk → screenshot → chat → TTS → pointing pipeline. Selects the active chat backend (cloud Claude or a local model server) via `activeChatProvider`. |
+| `MenuBarPanelManager.swift` | ~268 | NSStatusItem + custom NSPanel lifecycle. Creates the menu bar icon, manages the floating companion panel (show/hide/position), installs click-outside-to-dismiss monitor, and repositions the panel when the chat backend's config changes or a model-discovery catalog arrives (Local shows extra rows). |
+| `CompanionPanelView.swift` | ~1020 | SwiftUI panel content for the menu bar dropdown. Shows companion status, push-to-talk instructions, a Claude | Local backend switch (with a Sonnet/Opus sub-picker for cloud, and base-URL/model/send-screen config + a tappable list of the models the local server reports, with vision marks, for one-tap selection), permissions UI, DM feedback button, and quit button. Dark aesthetic using `DS` design system. |
 | `OverlayWindow.swift` | ~881 | Full-screen transparent overlay hosting the blue cursor, response text, waveform, and spinner. Handles cursor animation, element pointing with bezier arcs, multi-monitor coordinate mapping, and fade-out transitions. |
 | `CompanionResponseOverlay.swift` | ~217 | SwiftUI view for the response text bubble and waveform displayed next to the cursor in the overlay. |
 | `CompanionScreenCaptureUtility.swift` | ~132 | Multi-monitor screenshot capture using ScreenCaptureKit. Returns labeled image data for each connected display. |
@@ -66,8 +68,10 @@ Worker vars: `ELEVENLABS_VOICE_ID`
 | `AppleSpeechTranscriptionProvider.swift` | ~147 | Local fallback transcription provider backed by Apple's Speech framework. |
 | `BuddyAudioConversionSupport.swift` | ~108 | Audio conversion helpers. Converts live mic buffers to PCM16 mono audio and builds WAV payloads for upload-based providers. |
 | `GlobalPushToTalkShortcutMonitor.swift` | ~132 | System-wide push-to-talk monitor. Owns the listen-only `CGEvent` tap and publishes press/release transitions. |
-| `ClaudeAPI.swift` | ~291 | Claude vision API client with streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
-| `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client. |
+| `ClaudeAPI.swift` | ~300 | Cloud chat client. Conforms to the `BuddyChatProvider` protocol. Streaming (SSE) and non-streaming modes. TLS warmup optimization, image MIME detection, conversation history support. |
+| `BuddyChatProvider.swift` | ~46 | Protocol surface for the chat "brain" (`analyzeImageStreaming` + `displayName`/`supportsVision`). Mirrors the transcription provider layer so the cloud (`ClaudeAPI`) and local (`LocalLLMProvider`) backends are interchangeable. |
+| `LocalLLMChatProvider.swift` | ~670 | Local chat backend. Talks to Ollama's native `/api/chat` (newline-delimited JSON) or an OpenAI-compatible `/v1/chat/completions` (SSE) server, auto-detected from the base URL. Vision via base64 images; a "send screen" toggle disables images for text-only models. Thinking-capable Ollama models run with `think:false` for a snappier spoken reply. A `discoverModels()` probe (`/api/tags` or `/v1/models`) returns a `LocalModelCatalog` of the available models with their vision/size metadata, which the panel lists for one-tap selection. |
+| `OpenAIAPI.swift` | ~142 | OpenAI GPT vision API client (cloud). |
 | `ElevenLabsTTSClient.swift` | ~81 | ElevenLabs TTS client. Sends text to the Worker proxy, plays back audio via `AVAudioPlayer`. Exposes `isPlaying` for transient cursor scheduling. |
 | `ElementLocationDetector.swift` | ~335 | Detects UI element locations in screenshots for cursor pointing. |
 | `DesignSystem.swift` | ~880 | Design system tokens — colors, corner radii, shared styles. All UI references `DS.Colors`, `DS.CornerRadius`, etc. |

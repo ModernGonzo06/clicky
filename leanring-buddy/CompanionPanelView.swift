@@ -12,7 +12,6 @@ import SwiftUI
 
 struct CompanionPanelView: View {
     @ObservedObject var companionManager: CompanionManager
-    @State private var emailInput: String = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -131,16 +130,6 @@ struct CompanionPanelView: View {
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(DS.Colors.textSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
-        } else if companionManager.allPermissionsGranted && !companionManager.hasSubmittedEmail {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Drop your email to get started.")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundColor(DS.Colors.textSecondary)
-                Text("If I keep building this, I'll keep you in the loop.")
-                    .font(.system(size: 11))
-                    .foregroundColor(DS.Colors.textTertiary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
         } else if companionManager.allPermissionsGranted {
             Text("You're all set. Hit Start to meet Clicky.")
                 .font(.system(size: 12, weight: .medium))
@@ -179,64 +168,26 @@ struct CompanionPanelView: View {
         }
     }
 
-    // MARK: - Email + Start Button
+    // MARK: - Start Button
 
     @ViewBuilder
     private var startButton: some View {
         if !companionManager.hasCompletedOnboarding && companionManager.allPermissionsGranted {
-            if !companionManager.hasSubmittedEmail {
-                VStack(spacing: 8) {
-                    TextField("Enter your email", text: $emailInput)
-                        .textFieldStyle(.plain)
-                        .font(.system(size: 13))
-                        .foregroundColor(DS.Colors.textPrimary)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                                .fill(Color.white.opacity(0.08))
-                        )
-                        .overlay(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
-                                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-                        )
-
-                    Button(action: {
-                        companionManager.submitEmail(emailInput)
-                    }) {
-                        Text("Submit")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundColor(DS.Colors.textOnAccent)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 10)
-                            .background(
-                                RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                                    .fill(emailInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                          ? DS.Colors.accent.opacity(0.4)
-                                          : DS.Colors.accent)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .pointerCursor()
-                    .disabled(emailInput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            } else {
-                Button(action: {
-                    companionManager.triggerOnboarding()
-                }) {
-                    Text("Start")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundColor(DS.Colors.textOnAccent)
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
-                                .fill(DS.Colors.accent)
-                        )
-                }
-                .buttonStyle(.plain)
-                .pointerCursor()
+            Button(action: {
+                companionManager.triggerOnboarding()
+            }) {
+                Text("Start")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(DS.Colors.textOnAccent)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: DS.CornerRadius.large, style: .continuous)
+                            .fill(DS.Colors.accent)
+                    )
             }
+            .buttonStyle(.plain)
+            .pointerCursor()
         }
     }
 
@@ -598,28 +549,88 @@ struct CompanionPanelView: View {
 
     // MARK: - Model Picker
 
+    // MARK: - Chat Backend Picker
+    //
+    // A segmented "Claude | Local" switch selects which brain powers the
+    // companion. When Claude is selected we show the Sonnet/Opus model
+    // sub-picker; when Local is selected we show base URL + model + the
+    // send-screen toggle and a live connection status.
+
     private var modelPickerRow: some View {
-        HStack {
-            Text("Model")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundColor(DS.Colors.textSecondary)
+        VStack(spacing: 10) {
+            HStack {
+                HStack(spacing: 6) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .frame(width: 16)
+                    Text("Chat")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
 
-            Spacer()
+                Spacer()
 
-            HStack(spacing: 0) {
-                modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
-                modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+                backendSegmentedControl
             }
-            .background(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .fill(Color.white.opacity(0.06))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 6, style: .continuous)
-                    .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
-            )
+            .padding(.vertical, 4)
+
+            // Cloud shows which Claude model; local shows the server config.
+            if companionManager.chatBackend == .claude {
+                modelSubPickerRow
+            } else {
+                localBackendConfigurationSection
+            }
         }
-        .padding(.vertical, 4)
+    }
+
+    private var backendSegmentedControl: some View {
+        HStack(spacing: 0) {
+            backendOptionButton(label: "Claude", backend: .claude)
+            backendOptionButton(label: "Local", backend: .local)
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+
+    private var modelSubPickerRow: some View {
+        HStack(spacing: 0) {
+            modelOptionButton(label: "Sonnet", modelID: "claude-sonnet-4-6")
+            modelOptionButton(label: "Opus", modelID: "claude-opus-4-6")
+        }
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+
+    private func backendOptionButton(label: String, backend: ChatBackend) -> some View {
+        let isSelected = companionManager.chatBackend == backend
+        return Button(action: {
+            companionManager.setChatBackend(backend)
+        }) {
+            Text(label)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textTertiary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSelected ? Color.white.opacity(0.1) : Color.clear)
+                )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
     }
 
     private func modelOptionButton(label: String, modelID: String) -> some View {
@@ -639,6 +650,256 @@ struct CompanionPanelView: View {
         }
         .buttonStyle(.plain)
         .pointerCursor()
+    }
+
+    // MARK: - Local Backend Configuration
+
+    private var localBackendConfigurationSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            localSettingRow(label: "Base URL", icon: "globe") {
+                TextField("http://localhost:11434", text: bindingForLocalBaseURL)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 170)
+            }
+
+            localSettingRow(label: "Model", icon: "cpu") {
+                TextField("qwen3.8:27b-mlx", text: bindingForLocalModel)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 170)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "eye")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textTertiary)
+                    .frame(width: 16)
+
+                Text("Send screen")
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(DS.Colors.textSecondary)
+
+                Text(companionManager.sendLocalScreenshots ? "Vision" : "Text only")
+                    .font(.system(size: 10))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                Spacer()
+
+                Toggle("", isOn: bindingForSendLocalScreenshots)
+                    .toggleStyle(.switch)
+                    .labelsHidden()
+                    .tint(DS.Colors.accent)
+                    .scaleEffect(0.8)
+            }
+            .padding(.vertical, 4)
+
+            localAvailabilityRow
+
+            localModelCatalogSection
+        }
+    }
+
+    private func localSettingRow<Content: View>(
+        label: String,
+        icon: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(DS.Colors.textTertiary)
+                .frame(width: 16)
+
+            Text(label)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundColor(DS.Colors.textSecondary)
+
+            Spacer()
+
+            content()
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var localAvailabilityRow: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(availabilityColor)
+                .frame(width: 6, height: 6)
+
+            Text(availabilityText)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(availabilityColor)
+
+            Spacer()
+
+            Button(action: {
+                companionManager.checkLocalLLMAvailability()
+            }) {
+                Text("Refresh")
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundColor(DS.Colors.textOnAccent)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill(DS.Colors.accent)
+                    )
+            }
+            .buttonStyle(.plain)
+            .pointerCursor()
+        }
+        .padding(.vertical, 4)
+    }
+
+    private var availabilityColor: Color {
+        switch companionManager.localLLMAvailability {
+        case .connected:
+            return DS.Colors.success
+        case .failed:
+            return DS.Colors.warning
+        case .checking, .idle:
+            return DS.Colors.textTertiary
+        }
+    }
+
+    private var availabilityText: String {
+        switch companionManager.localLLMAvailability {
+        case .connected:
+            let catalog = companionManager.localModelCatalog
+            let modelCount = catalog.models.count
+            let countLabel = "model\(modelCount == 1 ? "" : "s")"
+            if let detail = catalog.configuredModelDetail {
+                let capability = detail.isVisionCapable ? "vision" : "text"
+                return "Connected · \(modelCount) \(countLabel) · \(capability)"
+            }
+            return "Connected · \(modelCount) \(countLabel) · model not found"
+        case .checking:
+            return "Checking…"
+        case .failed(let reason):
+            return "Not reachable (\(reason))"
+        case .idle:
+            return "Not connected"
+        }
+    }
+
+    // MARK: - Available-models list
+
+    /// A compact list of the models the local server reported on the last
+    /// probe, populated by the "Refresh" button. Each row is tappable to select
+    /// that model, and vision-capable models are marked so the user can pick one
+    /// that actually sees the screen. Renders nothing until a probe succeeds.
+    @ViewBuilder
+    private var localModelCatalogSection: some View {
+        if !companionManager.localModelCatalog.models.isEmpty {
+            VStack(alignment: .leading, spacing: 3) {
+                Text("AVAILABLE ON THIS MACHINE")
+                    .font(.system(size: 9, weight: .semibold, design: .rounded))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                ForEach(companionManager.localModelCatalog.models.prefix(6), id: \.self) { detail in
+                    localModelChip(detail: detail, isSelected: isLocalModelSelected(detail))
+                }
+
+                if companionManager.localModelCatalog.models.count > 6 {
+                    Text("and \(companionManager.localModelCatalog.models.count - 6) more")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                        .padding(.top, 1)
+                }
+            }
+            .padding(.top, 2)
+        }
+    }
+
+    /// A single tappable row for a model the local server reported.
+    /// Vision-capable models get a filled eye in the accent color so the user
+    /// can tell which ones see the screen at a glance.
+    private func localModelChip(detail: LocalModelDetail, isSelected: Bool) -> some View {
+        Button(action: {
+            companionManager.setLocalModel(detail.name)
+        }) {
+            HStack(spacing: 6) {
+                Image(systemName: detail.isVisionCapable ? "eye.fill" : "eye")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(detail.isVisionCapable ? DS.Colors.accent : DS.Colors.textTertiary)
+
+                Text(detail.name)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(isSelected ? DS.Colors.textPrimary : DS.Colors.textSecondary)
+
+                Spacer()
+
+                if !detail.descriptor.isEmpty {
+                    Text(detail.descriptor)
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(DS.Colors.textTertiary)
+                }
+
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundColor(DS.Colors.accent)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .fill(isSelected ? DS.Colors.accent.opacity(0.16) : Color.white.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(isSelected ? DS.Colors.accent : DS.Colors.borderSubtle,
+                            lineWidth: isSelected ? 0.8 : 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .pointerCursor()
+    }
+
+    /// Whether a catalog entry matches the currently configured model, tolerating
+    /// the bare-vs-tagged mismatch users hit (e.g. "qwen3.8" vs
+    /// "qwen3.8:27b-mlx") by comparing the part before the first colon.
+    private func isLocalModelSelected(_ detail: LocalModelDetail) -> Bool {
+        let configured = companionManager.localModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !configured.isEmpty else {
+            return false
+        }
+        if configured == detail.name {
+            return true
+        }
+        let configuredBase = configured.split(separator: ":", maxSplits: 1).first.map(String.init) ?? configured
+        let detailBase = detail.name.split(separator: ":", maxSplits: 1).first.map(String.init) ?? detail.name
+        return configuredBase == detailBase
+    }
+
+    // Binding bridges between the panel and the manager's stored config
+    // setters (which also persist to UserDefaults and keep the provider in sync).
+    private var bindingForLocalBaseURL: Binding<String> {
+        Binding(
+            get: { companionManager.localBaseURL },
+            set: { companionManager.setLocalBaseURL($0) }
+        )
+    }
+
+    private var bindingForLocalModel: Binding<String> {
+        Binding(
+            get: { companionManager.localModel },
+            set: { companionManager.setLocalModel($0) }
+        )
+    }
+
+    private var bindingForSendLocalScreenshots: Binding<Bool> {
+        Binding(
+            get: { companionManager.sendLocalScreenshots },
+            set: { companionManager.setSendLocalScreenshots($0) }
+        )
     }
 
     // MARK: - DM Farza Button

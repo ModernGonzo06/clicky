@@ -12,6 +12,7 @@
 //
 
 import AppKit
+import Combine
 import SwiftUI
 
 extension Notification.Name {
@@ -30,6 +31,7 @@ final class MenuBarPanelManager: NSObject {
     private var panel: NSPanel?
     private var clickOutsideMonitor: Any?
     private var dismissPanelObserver: NSObjectProtocol?
+    private var contentResizeCancellable: AnyCancellable?
 
     private let companionManager: CompanionManager
     private let panelWidth: CGFloat = 320
@@ -47,6 +49,18 @@ final class MenuBarPanelManager: NSObject {
         ) { [weak self] _ in
             self?.hidePanel()
         }
+
+        // When the chat backend or its config changes, the panel's content
+        // height changes (Local shows extra rows). A model-discovery probe also
+        // grows the panel when its result arrives, so we watch the catalog too.
+        // Reposition the open panel so it still snugly wraps the content
+        // instead of clipping.
+        contentResizeCancellable = companionManager.$chatBackend
+            .combineLatest(companionManager.$sendLocalScreenshots)
+            .combineLatest(companionManager.$localModelCatalog)
+            .sink { [weak self] _ in
+                self?.repositionPanelIfVisible()
+            }
     }
 
     deinit {
@@ -55,6 +69,17 @@ final class MenuBarPanelManager: NSObject {
         }
         if let observer = dismissPanelObserver {
             NotificationCenter.default.removeObserver(observer)
+        }
+        contentResizeCancellable?.cancel()
+    }
+
+    /// Re-runs the snug-fit layout after the panel's content height changes
+    /// (e.g. switching to the Local backend adds config rows). A short delay
+    /// lets SwiftUI finish its layout pass before we read the fitting size.
+    private func repositionPanelIfVisible() {
+        guard panel?.isVisible == true else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.positionPanelBelowStatusItem()
         }
     }
 

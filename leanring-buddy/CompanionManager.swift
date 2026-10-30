@@ -106,6 +106,13 @@ final class CompanionManager: ObservableObject {
         return ElevenLabsTTSClient(proxyURL: "\(Self.workerBaseURL)/tts")
     }()
 
+    /// Local text-to-speech via the macOS system voice. The fall-back for
+    /// when the ElevenLabs request fails — e.g. a fully-local setup with no
+    /// deployed Cloudflare Worker. Mirrors the ElevenLabs client interface.
+    private lazy var systemTTSClient: SystemTTSClient = {
+        return SystemTTSClient()
+    }()
+
     /// Local model server backend (Ollama native or OpenAI-compatible),
     /// auto-detected from the configured base URL. Built from persisted config
     /// and lazily initialized; updated in place when the user edits settings.
@@ -647,6 +654,7 @@ final class CompanionManager: ObservableObject {
             // Cancel any in-progress response and TTS from a previous utterance
             currentResponseTask?.cancel()
             elevenLabsTTSClient.stopPlayback()
+            systemTTSClient.stopPlayback()
             clearDetectedElementLocation()
 
             // Dismiss the onboarding prompt if it's showing
@@ -739,6 +747,7 @@ final class CompanionManager: ObservableObject {
     private func sendTranscriptToClaudeWithScreenshot(transcript: String) {
         currentResponseTask?.cancel()
         elevenLabsTTSClient.stopPlayback()
+        systemTTSClient.stopPlayback()
 
         currentResponseTask = Task {
             // Stay in processing (spinner) state — no streaming text displayed
@@ -864,8 +873,13 @@ final class CompanionManager: ObservableObject {
                         voiceState = .responding
                     } catch {
                         ClickyAnalytics.trackTTSError(error: error.localizedDescription)
-                        print("⚠️ ElevenLabs TTS error: \(error)")
-                        speakCreditsErrorFallback()
+                        print("⚠️ ElevenLabs TTS error: \(error) — falling back to the system voice")
+                        // ElevenLabs is unreachable (no deployed worker, exhausted
+                        // credits, or a dead network). Rather than dropping the
+                        // reply the user just waited for, speak it in the macOS
+                        // system voice so it's still heard.
+                        systemTTSClient.speakText(spokenText)
+                        voiceState = .responding
                     }
                 }
             } catch is CancellationError {
@@ -892,8 +906,9 @@ final class CompanionManager: ObservableObject {
 
         transientHideTask?.cancel()
         transientHideTask = Task {
-            // Wait for TTS audio to finish playing
-            while elevenLabsTTSClient.isPlaying {
+            // Wait for TTS audio to finish playing (whichever voice was used —
+            // ElevenLabs or the system-voice fallback)
+            while elevenLabsTTSClient.isPlaying || systemTTSClient.isSpeaking {
                 try? await Task.sleep(nanoseconds: 200_000_000)
                 guard !Task.isCancelled else { return }
             }
@@ -913,13 +928,11 @@ final class CompanionManager: ObservableObject {
         }
     }
 
-    /// Speaks a hardcoded error message using macOS system TTS when API
-    /// credits run out. Uses NSSpeechSynthesizer so it works even when
-    /// ElevenLabs is down.
+    /// Speaks a hardcoded error message using the macOS system voice when the
+    /// chat request itself fails and there is no reply to fall back on.
     private func speakCreditsErrorFallback() {
         let utterance = "I'm all out of credits. Please DM Farza and tell him to bring me back to life."
-        let synthesizer = NSSpeechSynthesizer()
-        synthesizer.startSpeaking(utterance)
+        systemTTSClient.speakText(utterance)
         voiceState = .responding
     }
 

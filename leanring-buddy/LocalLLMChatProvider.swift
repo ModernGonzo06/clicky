@@ -11,11 +11,15 @@
 //        Images go in the user message under an "images" array of base64 strings.
 //
 //    - OpenAI-compatible     -> POST {base}/v1/chat/completions
-//        (LM Studio, llama.cpp/llama-server, vLLM, Ollama's /v1 alias, ...)
+//        (LM Studio, llama.cpp/llama-server, vLLM, Ollama's /v1 alias,
+//        oMLX, ...)
 //        Streams Server-Sent Events ("data: {json}" lines ending in "[DONE]").
 //        Images go in the user message as {type:"image_url"} content blocks.
 //
 //  Because everything runs on localhost there is no TLS warmup and no proxy.
+//  An optional Bearer API key can be configured for servers that require
+//  authentication (oMLX does, returning 401 without it; Ollama and LM
+//  Studio don't, and simply ignore the header).
 //  Vision works with either format; whether images are actually sent is the
 //  caller's decision via an empty `images` array.
 //
@@ -69,19 +73,21 @@ struct LocalModelDetail: Equatable, Hashable {
     /// Full name as the server reports it (e.g. "qwen3.8:27b-mlx", "llava:latest").
     let name: String
 
-    /// Size in bytes. 0 when the server doesn't report it (OpenAI-compatible servers usually don't).
-    let sizeBytes: Int
+    /// Size in bytes. 0 when the server doesn't report it. Mutable because
+    /// the oMLX admin enrichment pass fills it in after the initial parse.
+    var sizeBytes: Int
 
     /// Capabilities the server advertises for this model (Ollama: "vision",
-    /// "thinking", "tools", ...). Empty for OpenAI-compatible servers, which
-    /// don't report capabilities.
-    let capabilities: [String]
+    /// "thinking", "tools", ...). Empty when the server doesn't report them;
+    /// the oMLX admin enrichment pass adds "vision"/"thinking" where known.
+    var capabilities: [String]
 
-    /// Inference runner, e.g. "mlx" or "cuda" (Ollama only).
-    let runner: String
+    /// Inference runner, e.g. "mlx" or "cuda". Filled in from the oMLX admin
+    /// API when available (oMLX is MLX-native by definition).
+    var runner: String
 
     /// Quantization level, e.g. "q4_0" or "nvfp4" (Ollama only).
-    let quantization: String
+    var quantization: String
 
     var isVisionCapable: Bool { capabilities.contains("vision") }
     var isThinkingCapable: Bool { capabilities.contains("thinking") }
@@ -157,14 +163,27 @@ final class LocalLLMProvider: BuddyChatProvider {
     /// Model id to request, e.g. "llava", "qwen2.5vl:7b", "llama3.2:3b".
     var model: String
 
+    /// Optional Bearer token for local servers that require authentication.
+    /// oMLX rejects every request without it (HTTP 401); Ollama and LM Studio
+    /// don't use one and ignore the header, so an empty value means "send no
+    /// Authorization header at all".
+    var apiKey: String
+
+    /// The catalog entry for `model` from the last successful discovery probe
+    /// (or nil before one has run). Lets request building consult the model's
+    /// real capabilities — e.g. whether it thinks — without re-fetching.
+    var knownConfiguredModelDetail: LocalModelDetail?
+
     /// Which API dialect to speak, derived from `baseURL`.
     private(set) var wireFormat: LocalChatWireFormat
 
     private let session: URLSession
 
-    init(baseURL: String, model: String) {
+    init(baseURL: String, model: String, apiKey: String = "") {
         self.baseURL = baseURL
         self.model = model
+        self.apiKey = apiKey
+        self.knownConfiguredModelDetail = nil
         self.wireFormat = LocalChatWireFormat.detect(from: baseURL)
 
         // localhost: .default config is fine. No cookie/url cache needed and
@@ -231,6 +250,36 @@ final class LocalLLMProvider: BuddyChatProvider {
             }
             return base?.appendingPathComponent("v1/models")
         }
+    }
+
+    /// oMLX-specific: the admin model-list endpoint on the same host:port.
+    /// Unlike the standard `/v1/models` (which only reports model ids), it
+    /// reports model type (llm/vlm), sizes, and thinking support — the
+    /// metadata the panel's capability badges need. Non-oMLX
+    /// OpenAI-compatible servers don't have this route (404), which the
+    /// enrichment pass treats as "keep the plain list".
+    private var omlxAdminModelsURL: URL? {
+        guard wireFormat == .openAICompatible else {
+            return nil
+        }
+        // The admin API lives at the server root, so strip the "/v1" suffix
+        // if the user's base URL includes it.
+        var raw = normalizedBaseURL
+        if raw.hasSuffix("/v1") {
+            raw = String(raw.dropLast("/v1".count))
+        }
+        return URL(string: raw)?.appendingPathComponent("admin/api/models")
+    }
+
+    /// Attaches the configured Bearer token, when one is set. oMLX requires
+    /// it on every inference and admin request (401 without); Ollama and LM
+    /// Studio ignore it, so it's safe to send whenever non-empty.
+    private func applyAuthorizationHeader(to request: inout URLRequest) {
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            return
+        }
+        request.setValue("Bearer \(trimmedKey)", forHTTPHeaderField: "Authorization")
     }
 
     // MARK: - BuddyChatProvider
@@ -312,6 +361,7 @@ final class LocalLLMProvider: BuddyChatProvider {
         request.httpMethod = "POST"
         request.timeoutInterval = 300
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        applyAuthorizationHeader(to: &request)
 
         let body = buildBody(
             images: images,
@@ -390,12 +440,21 @@ final class LocalLLMProvider: BuddyChatProvider {
             "messages": messages
         ]
 
-        // Thinking-capable Ollama models stream a private "thinking" phase
-        // before the answer, adding latency to every spoken turn. Disable it
-        // for a snappier reply. Ollama-specific — OpenAI-compatible servers
-        // don't understand this flag, so only send it for Ollama.
+        // Thinking-capable models stream a private reasoning phase before the
+        // answer, adding a second or more of latency to every spoken turn with
+        // no benefit for a short spoken reply — so disable it for a snappier
+        // answer. The two wire formats take it differently:
+        //   - Ollama native understands a top-level "think" flag, sent always
+        //     (Ollama ignores it for non-thinking models).
+        //   - OpenAI-compatible servers don't understand "think", but oMLX
+        //     honors the Qwen-style "enable_thinking" chat-template kwarg, so
+        //     send that one — and only when the discovery probe told us the
+        //     configured model actually thinks, so servers whose templates
+        //     don't define the variable are never sent it.
         if wireFormat == .ollamaNative {
             body["think"] = enableThinking
+        } else if !enableThinking, knownConfiguredModelDetail?.isThinkingCapable == true {
+            body["chat_template_kwargs"] = ["enable_thinking": false]
         }
 
         return body
@@ -478,6 +537,7 @@ final class LocalLLMProvider: BuddyChatProvider {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 12
+        applyAuthorizationHeader(to: &request)
 
         do {
             let (data, response) = try await session.data(for: request)
@@ -562,6 +622,7 @@ final class LocalLLMProvider: BuddyChatProvider {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.timeoutInterval = 12
+        applyAuthorizationHeader(to: &request)
 
         do {
             let (data, response) = try await session.data(for: request)
@@ -572,7 +633,16 @@ final class LocalLLMProvider: BuddyChatProvider {
                 return .error(reason: "HTTP \(httpResponse.statusCode)")
             }
 
-            let details = parseModelCatalog(from: data)
+            var details = parseModelCatalog(from: data)
+
+            // Standard /v1/models only reports model ids, so the OpenAI path
+            // has no capability or size metadata. oMLX is the one common
+            // OpenAI-compatible server that exposes a richer admin endpoint,
+            // so try it to fill in vision/thinking/size for the panel.
+            if wireFormat == .openAICompatible {
+                details = await enrichWithOmlxAdminMetadata(details)
+            }
+
             let matched = matchModelDetail(for: model, in: details)
             return LocalModelCatalog(
                 connected: true,
@@ -583,6 +653,79 @@ final class LocalLLMProvider: BuddyChatProvider {
             )
         } catch {
             return .error(reason: error.localizedDescription)
+        }
+    }
+
+    /// Best-effort fetch of oMLX's admin model endpoint (`/admin/api/models`),
+    /// merging its richer per-model metadata into the parsed catalog:
+    ///   - `"model_type": "vlm"`        -> "vision" capability (the eye badge)
+    ///   - non-empty `thinking_modes`   -> "thinking" capability (lets
+    ///                                     request building send the
+    ///                                     `enable_thinking: false` kwarg)
+    ///   - `estimated_size`             -> the size the panel descriptor shows
+    ///   - runner defaults to "mlx"     -> oMLX is MLX-native by definition
+    ///
+    /// The admin API accepts the same main API key as the inference API. Any
+    /// failure — 404 on non-oMLX servers, 401 with a wrong key, connection
+    /// error — returns the details unchanged: the plain `/v1/models` list is
+    /// still fully correct for sending chat requests, capabilities just
+    /// default to "text".
+    private func enrichWithOmlxAdminMetadata(
+        _ details: [LocalModelDetail]
+    ) async -> [LocalModelDetail] {
+        guard let url = omlxAdminModelsURL else {
+            return details
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 12
+        applyAuthorizationHeader(to: &request)
+
+        do {
+            let (data, response) = try await session.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse,
+                  (200...299).contains(httpResponse.statusCode)
+            else {
+                return details
+            }
+
+            // The admin endpoint returns a bare JSON array of model objects.
+            guard let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                return details
+            }
+
+            var adminEntryByModelID: [String: [String: Any]] = [:]
+            for entry in entries {
+                if let modelID = entry["id"] as? String {
+                    adminEntryByModelID[modelID] = entry
+                }
+            }
+
+            return details.map { detail in
+                guard let adminEntry = adminEntryByModelID[detail.name] else {
+                    return detail
+                }
+
+                var enriched = detail
+                if (adminEntry["model_type"] as? String) == "vlm" {
+                    enriched.capabilities.append("vision")
+                }
+                if let thinkingModes = adminEntry["thinking_modes"] as? [String],
+                   !thinkingModes.isEmpty {
+                    enriched.capabilities.append("thinking")
+                }
+                if let estimatedSize = adminEntry["estimated_size"] as? Int,
+                   estimatedSize > 0 {
+                    enriched.sizeBytes = estimatedSize
+                }
+                if enriched.runner.isEmpty {
+                    enriched.runner = "mlx"
+                }
+                return enriched
+            }
+        } catch {
+            return details
         }
     }
 

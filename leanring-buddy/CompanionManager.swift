@@ -43,6 +43,7 @@ private enum ChatBackendPreferences {
     static let backend = "clickyChatBackend"
     static let localBaseURL = "clickyLocalBaseURL"
     static let localModel = "clickyLocalModel"
+    static let localAPIKey = "clickyLocalAPIKey"
     static let sendLocalScreenshots = "clickySendLocalScreenshots"
 }
 
@@ -109,7 +110,7 @@ final class CompanionManager: ObservableObject {
     /// auto-detected from the configured base URL. Built from persisted config
     /// and lazily initialized; updated in place when the user edits settings.
     private lazy var localLLMProvider: LocalLLMProvider = {
-        return LocalLLMProvider(baseURL: localBaseURL, model: localModel)
+        return LocalLLMProvider(baseURL: localBaseURL, model: localModel, apiKey: localAPIKey)
     }()
 
     /// The chat backend currently driving the companion. Selected by
@@ -135,6 +136,11 @@ final class CompanionManager: ObservableObject {
     /// placeholder shows the format ("e.g. qwen3.8:27b-mlx") as a hint.
     private static let defaultLocalModel =
         AppBundleConfiguration.stringValue(forKey: "LocalLLMModel") ?? ""
+    /// No default API key: servers that require one (oMLX) generate their own,
+    /// and the user pastes it into the panel. Ollama and LM Studio work with
+    /// an empty value, so a fresh install needs no key at all.
+    private static let defaultLocalAPIKey =
+        AppBundleConfiguration.stringValue(forKey: "LocalLLMAPIKey") ?? ""
 
     /// Which brain the companion talks to. Drives `activeChatProvider`.
     @Published var chatBackend: ChatBackend =
@@ -148,6 +154,13 @@ final class CompanionManager: ObservableObject {
     /// Model id passed to the local server (e.g. "llava", "qwen2.5vl:7b").
     @Published var localModel: String =
         ChatBackendPreferences.localModel.load(default: CompanionManager.defaultLocalModel)
+
+    /// Optional Bearer key for local servers that require authentication —
+    /// oMLX enforces one and returns 401 without it; Ollama and LM Studio
+    /// don't need one. It stays in UserDefaults on this machine and is only
+    /// ever attached to requests against the local base URL.
+    @Published var localAPIKey: String =
+        ChatBackendPreferences.localAPIKey.load(default: CompanionManager.defaultLocalAPIKey)
 
     /// When the local backend is active, whether screenshots are sent to the
     /// model. Off -> text-only (works for text models, no element pointing).
@@ -171,6 +184,7 @@ final class CompanionManager: ObservableObject {
         // right place, and kick it into existence if this is the first use.
         localLLMProvider.baseURL = localBaseURL
         localLLMProvider.model = localModel
+        localLLMProvider.apiKey = localAPIKey
         if backend == .local {
             checkLocalLLMAvailability()
         }
@@ -191,6 +205,15 @@ final class CompanionManager: ObservableObject {
         localLLMProvider.model = localModel
     }
 
+    func setLocalAPIKey(_ localAPIKey: String) {
+        self.localAPIKey = localAPIKey
+        UserDefaults.standard.set(localAPIKey, forKey: ChatBackendPreferences.localAPIKey)
+        localLLMProvider.apiKey = localAPIKey
+        if chatBackend == .local {
+            checkLocalLLMAvailability()
+        }
+    }
+
     func setSendLocalScreenshots(_ sendLocalScreenshots: Bool) {
         self.sendLocalScreenshots = sendLocalScreenshots
         UserDefaults.standard.set(sendLocalScreenshots, forKey: ChatBackendPreferences.sendLocalScreenshots)
@@ -206,6 +229,10 @@ final class CompanionManager: ObservableObject {
         Task { @MainActor in
             let catalog = await localLLMProvider.discoverModels()
             self.localModelCatalog = catalog
+            // Keep the provider's own view of the model in sync so request
+            // building can consult its capabilities (e.g. whether it thinks)
+            // without re-fetching the catalog.
+            self.localLLMProvider.knownConfiguredModelDetail = catalog.configuredModelDetail
             self.localLLMAvailability = catalog.connected
                 ? .connected
                 : .failed(catalog.reason ?? "unreachable")
@@ -300,6 +327,14 @@ final class CompanionManager: ObservableObject {
         // Eagerly touch the Claude API so its TLS warmup handshake completes
         // well before the onboarding demo fires at ~40s into the video.
         _ = claudeAPI
+
+        // If the user's persisted brain is the local backend, probe it now so
+        // the model catalog — and with it the thinking/vision metadata that
+        // shapes outgoing requests — is populated before the first
+        // interaction, not only when the panel happens to open first.
+        if chatBackend == .local {
+            checkLocalLLMAvailability()
+        }
 
         // If the user already completed onboarding AND all permissions are
         // still granted, show the cursor overlay immediately. If permissions

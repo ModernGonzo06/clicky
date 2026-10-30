@@ -674,6 +674,15 @@ struct CompanionPanelView: View {
                     .frame(width: 170)
             }
 
+            localSettingRow(label: "API Key", icon: "key") {
+                SecureField("optional for Ollama", text: bindingForLocalAPIKey)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(DS.Colors.textPrimary)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 170)
+            }
+
             HStack(spacing: 8) {
                 Image(systemName: "eye")
                     .font(.system(size: 12, weight: .medium))
@@ -892,6 +901,13 @@ struct CompanionPanelView: View {
         Binding(
             get: { companionManager.localModel },
             set: { companionManager.setLocalModel($0) }
+        )
+    }
+
+    private var bindingForLocalAPIKey: Binding<String> {
+        Binding(
+            get: { companionManager.localAPIKey },
+            set: { companionManager.setLocalAPIKey($0) }
         )
     }
 
